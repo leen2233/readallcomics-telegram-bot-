@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue]
+cloudscraper
+beautifulsoup4
+lxml
+Pillow
+pypdf
+aiohttp
+aiofiles
+python-dotenv
