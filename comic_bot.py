@@ -126,7 +126,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str) -> None:
     """Process all chapters from a category URL"""
-    message = update.message
+    message = update.message or update.channel_post
     status_message = await message.reply_text("🔍 Finding chapters...")
 
     try:
@@ -193,11 +193,12 @@ async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def received_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Store the URL and process the download"""
-    url = update.message.text.strip()
+    message = update.message or update.channel_post
+    url = message.text.strip()
 
     # Validate URL
     if "readallcomics.com" not in url:
-        await update.message.reply_text(
+        await message.reply_text(
             "❌ Please send a valid readallcomics.com URL"
         )
         return URL
@@ -215,7 +216,7 @@ async def received_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def process_single_comic(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     """Process single comic download"""
-    message = update.message
+    message = update.message or update.channel_post
     status_message = await message.reply_text("⏳ Starting download...")
 
     try:
@@ -323,7 +324,8 @@ def main() -> None:
     # Add URL handler for direct comic downloads (without /start)
     async def handle_direct_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle direct URL messages without /start command"""
-        text = update.message.text.strip()
+        message = update.message or update.channel_post
+        text = message.text.strip()
 
         if "readallcomics.com" in text:
             # Check if it's a category URL (contains /category/)
@@ -336,6 +338,11 @@ def main() -> None:
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_url)
+    )
+
+    # Add handler for channel posts
+    application.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL & filters.TEXT & ~filters.COMMAND, handle_direct_url)
     )
 
     # Run the bot
