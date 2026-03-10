@@ -132,6 +132,8 @@ async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         # Get all chapters
         chapters = get_comic_chapters(category_url)
+        # Reverse to download from last chapter first
+        chapters.reverse()
 
         if not chapters:
             await status_message.edit_text("❌ No chapters found. Please check the URL.")
