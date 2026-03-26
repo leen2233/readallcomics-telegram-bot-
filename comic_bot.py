@@ -30,10 +30,94 @@ from PIL import Image
 # Load environment variables from .env file
 load_dotenv()
 
+# Configuration
+DOWNLOAD_DOMAIN = os.environ.get("DOWNLOAD_DOMAIN", "")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "./downloads")
+TELEGRAM_FILE_SIZE_LIMIT = 50 * 1024 * 1024  # 50MB in bytes
+
+# Ensure download directory exists
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 # Conversation states
 URL = range(1)
 
 scraper = cloudscraper.create_scraper()
+
+
+def parse_message_with_flags(text: str) -> tuple:
+    """
+    Parse message text to extract URL and flags.
+    Returns: (url, flags) where flags is a set of flag strings
+    """
+    parts = text.strip().split()
+    url = None
+    flags = set()
+
+    for part in parts:
+        if part.startswith("-") and part.startswith("http"):
+            # Handle cases like "-webhttps://..." - add space before http
+            url = part[part.index("http"):]
+            flags.add(part[:part.index("http")])
+        elif part.startswith("-"):
+            flags.add(part.lower())
+        elif not url and "http" in part:
+            url = part
+
+    return url, flags
+
+
+def cleanup_old_files(directory: str, max_age_days: int = 7) -> None:
+    """
+    Remove files older than max_age_days from the specified directory.
+    """
+    import time
+
+    try:
+        current_time = time.time()
+        max_age_seconds = max_age_days * 24 * 60 * 60
+
+        for filename in os.listdir(directory):
+            filepath = os.path.join(directory, filename)
+            if os.path.isfile(filepath):
+                file_age = current_time - os.path.getmtime(filepath)
+                if file_age > max_age_seconds:
+                    try:
+                        os.remove(filepath)
+                        print(f"Removed old file: {filename}")
+                    except Exception as e:
+                        print(f"Error removing {filename}: {e}")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+
+def save_file_to_server(source_path: str, filename: str) -> str:
+    """
+    Save file to server directory and return download URL.
+    """
+    import shutil
+
+    # Sanitize filename
+    safe_filename = "".join(c for c in filename if c.isalnum() or c in (' ', '-', '_', '.')).strip()
+    if not safe_filename:
+        safe_filename = "comic.cbz"
+
+    dest_path = os.path.join(DOWNLOAD_DIR, safe_filename)
+
+    # Copy file to download directory
+    shutil.copy2(source_path, dest_path)
+
+    # Build URL
+    if DOWNLOAD_DOMAIN:
+        # Remove trailing slash from domain if present
+        domain = DOWNLOAD_DOMAIN.rstrip("/")
+        return f"{domain}/{safe_filename}"
+    else:
+        return f"File saved to: {dest_path}"
+
+
+def get_file_size(filepath: str) -> int:
+    """Get file size in bytes"""
+    return os.path.getsize(filepath)
 
 
 def get_title_from_url(url: str) -> str:
@@ -112,6 +196,74 @@ def download_images_to_cbz(urls: List[str], output_filename: str) -> str:
     return output_filename
 
 
+def create_zip_from_chapters(chapters: List[dict], output_filename: str, status_callback=None) -> str:
+    """
+    Download all chapters and create a single ZIP file containing all CBZ files.
+    """
+    import zipfile
+
+    with zipfile.ZipFile(output_filename, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for i, chapter in enumerate(chapters, 1):
+            chapter_url = chapter["url"]
+            chapter_name = chapter["name"]
+
+            if status_callback:
+                status_callback(f"📥 [{i}/{len(chapters)}] {chapter_name}")
+
+            try:
+                # Get images for this chapter
+                urls = get_comic_images(chapter_url)
+
+                if not urls:
+                    print(f"Skipped: {chapter_name} (no images found)")
+                    continue
+
+                # Create CBZ in memory
+                import io
+                cbz_buffer = io.BytesIO()
+
+                with zipfile.ZipFile(cbz_buffer, 'w', zipfile.ZIP_DEFLATED) as cbz:
+                    for j, url in enumerate(urls, 1):
+                        try:
+                            response = scraper.get(url, timeout=30)
+                            response.raise_for_status()
+                            img_filename = f"{j:03d}.jpg"
+                            cbz.writestr(img_filename, response.content)
+                        except Exception as e:
+                            print(f"Error downloading image {j} for {chapter_name}: {e}")
+                            continue
+
+                # Verify CBZ has images
+                cbz_buffer.seek(0)
+                with zipfile.ZipFile(cbz_buffer, 'r') as cbz_check:
+                    if len(cbz_check.namelist()) == 0:
+                        print(f"Skipped: {chapter_name} (no images successfully downloaded)")
+                        continue
+
+                # Sanitize chapter name for filename
+                safe_chapter_name = "".join(c for c in chapter_name if c.isalnum() or c in (' ', '-', '_')).strip()
+                if not safe_chapter_name:
+                    safe_chapter_name = f"chapter_{i}"
+
+                # Add CBZ to ZIP
+                cbz_buffer.seek(0)
+                zip_filename = f"{safe_chapter_name}.cbz"
+                zip_file.writestr(zip_filename, cbz_buffer.getvalue())
+
+            except Exception as e:
+                print(f"Error processing {chapter_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+    # Verify the ZIP has files
+    with zipfile.ZipFile(output_filename, 'r') as zip_file:
+        if len(zip_file.namelist()) == 0:
+            raise ValueError("No chapters were successfully downloaded")
+
+    return output_filename
+
+
 # Telegram Bot Handlers
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -124,12 +276,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return URL
 
 
-async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str) -> None:
-    """Process all chapters from a category URL"""
+async def process_all_chapters_zip(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str) -> None:
+    """Process all chapters from a category URL and create a single ZIP file"""
     message = update.message or update.channel_post
     status_message = await message.reply_text("🔍 Finding chapters...")
 
     try:
+        # Cleanup old files
+        cleanup_old_files(DOWNLOAD_DIR)
+
+        # Get all chapters
+        chapters = get_comic_chapters(category_url)
+        # Reverse to download from first chapter first
+        chapters.reverse()
+
+        if not chapters:
+            await status_message.edit_text("❌ No chapters found. Please check the URL.")
+            return
+
+        await status_message.edit_text(f"📚 Found {len(chapters)} chapters. Creating ZIP...")
+
+        # Get title from URL for ZIP filename
+        title = get_title_from_url(category_url)
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+        if not safe_title:
+            safe_title = "comic"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, f"{safe_title}.zip")
+
+            # Create ZIP with all chapters
+            def status_callback(msg):
+                import asyncio
+                asyncio.create_task(status_message.edit_text(msg))
+
+            create_zip_from_chapters(chapters, zip_path, status_callback)
+
+            # Get file size
+            file_size = get_file_size(zip_path)
+            size_mb = file_size / (1024 * 1024)
+
+            # Save to server and get URL
+            await status_message.edit_text("📤 Saving to server...")
+            download_url = save_file_to_server(zip_path, f"{safe_title}.zip")
+
+            await status_message.edit_text(
+                f"✅ ZIP file created!\n"
+                f"📁 {len(chapters)} chapters\n"
+                f"📦 {size_mb:.1f} MB\n"
+                f"🔗 {download_url}"
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await status_message.edit_text(f"❌ Error: {str(e)}")
+
+
+async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str, flags: set = None) -> None:
+    """Process all chapters from a category URL"""
+    if flags is None:
+        flags = set()
+
+    # If -zip flag is present, create single ZIP
+    if "-zip" in flags:
+        await process_all_chapters_zip(update, context, category_url)
+        return
+
+    message = update.message or update.channel_post
+    status_message = await message.reply_text("🔍 Finding chapters...")
+
+    try:
+        # Cleanup old files
+        cleanup_old_files(DOWNLOAD_DIR)
+
         # Get all chapters
         chapters = get_comic_chapters(category_url)
         # Reverse to download from last chapter first
@@ -167,15 +387,27 @@ async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYP
                     # Download and create CBZ
                     download_images_to_cbz(urls, cbz_path)
 
-                    # Send CBZ
+                    # Get file size
+                    file_size = get_file_size(cbz_path)
                     filename = f"{safe_title}.cbz"
 
-                    with open(cbz_path, 'rb') as f:
-                        await message.reply_document(
-                            document=f,
-                            filename=filename,
-                            caption=f"📚 {chapter_name}\n{i}/{len(chapters)} • {len(urls)} pages"
+                    # Check if we should send to Telegram or save to server
+                    if "-web" in flags or file_size > TELEGRAM_FILE_SIZE_LIMIT:
+                        # Save to server
+                        download_url = save_file_to_server(cbz_path, filename)
+                        await message.reply_text(
+                            f"📚 {chapter_name}\n"
+                            f"🔗 {download_url}\n"
+                            f"📦 {file_size / (1024 * 1024):.1f} MB"
                         )
+                    else:
+                        # Send to Telegram
+                        with open(cbz_path, 'rb') as f:
+                            await message.reply_document(
+                                document=f,
+                                filename=filename,
+                                caption=f"📚 {chapter_name}\n{i}/{len(chapters)} • {len(urls)} pages"
+                            )
 
             except Exception as e:
                 import traceback
@@ -194,10 +426,13 @@ async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYP
 async def received_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Store the URL and process the download"""
     message = update.message or update.channel_post
-    url = message.text.strip()
+    text = message.text.strip()
+
+    # Parse URL and flags
+    url, flags = parse_message_with_flags(text)
 
     # Validate URL
-    if "readallcomics.com" not in url:
+    if not url or "readallcomics.com" not in url:
         await message.reply_text(
             "❌ Please send a valid readallcomics.com URL"
         )
@@ -206,20 +441,26 @@ async def received_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Check if it's a category URL (contains /category/)
     if "/category/" in url:
         # Extract chapters and download all
-        await process_all_chapters(update, context, url)
+        await process_all_chapters(update, context, url, flags)
     else:
         # Single comic download
-        await process_single_comic(update, context, url)
+        await process_single_comic(update, context, url, flags)
 
     return ConversationHandler.END
 
 
-async def process_single_comic(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+async def process_single_comic(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, flags: set = None) -> None:
     """Process single comic download"""
+    if flags is None:
+        flags = set()
+
     message = update.message or update.channel_post
     status_message = await message.reply_text("⏳ Starting download...")
 
     try:
+        # Cleanup old files
+        cleanup_old_files(DOWNLOAD_DIR)
+
         with tempfile.TemporaryDirectory() as temp_dir:
             cbz_path = os.path.join(temp_dir, "comic.cbz")
 
@@ -244,18 +485,32 @@ async def process_single_comic(update: Update, context: ContextTypes.DEFAULT_TYP
             await status_message.edit_text(f"📥 Downloading {len(urls)} pages...")
             download_images_to_cbz(urls, cbz_path)
 
-            # Send CBZ
-            await status_message.edit_text("📤 Sending your CBZ...")
+            # Get file size
+            file_size = get_file_size(cbz_path)
+            size_mb = file_size / (1024 * 1024)
             filename = f"{safe_title}.cbz"
 
-            with open(cbz_path, 'rb') as f:
-                await message.reply_document(
-                    document=f,
-                    filename=filename,
-                    caption=f"📚 {title}\n{len(urls)} pages"
+            # Check if we should send to Telegram or save to server
+            if "-web" in flags or file_size > TELEGRAM_FILE_SIZE_LIMIT:
+                # Save to server
+                await status_message.edit_text("📤 Saving to server...")
+                download_url = save_file_to_server(cbz_path, filename)
+                await status_message.edit_text(
+                    f"✅ Download complete!\n"
+                    f"📚 {title}\n"
+                    f"📦 {size_mb:.1f} MB • {len(urls)} pages\n"
+                    f"🔗 {download_url}"
                 )
-
-            await status_message.delete()
+            else:
+                # Send to Telegram
+                await status_message.edit_text("📤 Sending your CBZ...")
+                with open(cbz_path, 'rb') as f:
+                    await message.reply_document(
+                        document=f,
+                        filename=filename,
+                        caption=f"📚 {title}\n{len(urls)} pages"
+                    )
+                await status_message.delete()
 
     except Exception as e:
         import traceback
@@ -284,11 +539,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - Show this help message\n"
         "/cancel - Cancel current operation\n\n"
         "How to download comics:\n"
-        "1. Send /start\n"
-        "2. Paste a readallcomics.com URL\n"
+        "1. Send /start or directly send a URL\n"
+        "2. Send a readallcomics.com URL with optional flags:\n"
         "   • Single issue: Direct URL to the comic page\n"
-        "   • Entire series: Category URL (e.g. /category/series-name/)\n"
-        "3. Receive the CBZ file(s)\n\n"
+        "   • Entire series: Category URL (e.g. /category/series-name/)\n\n"
+        "Available flags:\n"
+        "• -web : Force save to server and return download link\n"
+        "• -zip : For category URLs, create a single ZIP with all chapters\n\n"
+        "Examples:\n"
+        "• https://readallcomics.com/spiderman-001/\n"
+        "• https://readallcomics.com/category/spiderman/ -web\n"
+        "• https://readallcomics.com/category/spiderman/ -zip\n\n"
+        "Note: Files over 50MB are automatically saved to server.\n\n"
         "CBZ files can be opened with any comic reader app!"
     )
     await update.message.reply_text(help_text)
@@ -328,13 +590,20 @@ def main() -> None:
         text = message.text.strip()
 
         if "readallcomics.com" in text:
+            # Parse URL and flags
+            url, flags = parse_message_with_flags(text)
+
+            if not url:
+                await message.reply_text("❌ Could not parse URL from message")
+                return
+
             # Check if it's a category URL (contains /category/)
-            if "/category/" in text:
+            if "/category/" in url:
                 # Extract chapters and download all
-                await process_all_chapters(update, context, text)
+                await process_all_chapters(update, context, url, flags)
             else:
                 # Single comic download
-                await process_single_comic(update, context, text)
+                await process_single_comic(update, context, url, flags)
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_url)
