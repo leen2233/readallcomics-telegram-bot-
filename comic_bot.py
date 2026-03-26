@@ -278,6 +278,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def process_all_chapters_zip(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str) -> None:
     """Process all chapters from a category URL and create a single ZIP file"""
+    import asyncio
+
     message = update.message or update.channel_post
     status_message = await message.reply_text("🔍 Finding chapters...")
 
@@ -294,7 +296,7 @@ async def process_all_chapters_zip(update: Update, context: ContextTypes.DEFAULT
             await status_message.edit_text("❌ No chapters found. Please check the URL.")
             return
 
-        await status_message.edit_text(f"📚 Found {len(chapters)} chapters. Creating ZIP...")
+        await status_message.edit_text(f"📚 Found {len(chapters)} chapters. Creating ZIP... (this may take a while)")
 
         # Get title from URL for ZIP filename
         title = get_title_from_url(category_url)
@@ -305,32 +307,42 @@ async def process_all_chapters_zip(update: Update, context: ContextTypes.DEFAULT
         with tempfile.TemporaryDirectory() as temp_dir:
             zip_path = os.path.join(temp_dir, f"{safe_title}.zip")
 
-            # Create ZIP with all chapters
-            def status_callback(msg):
-                import asyncio
-                asyncio.create_task(status_message.edit_text(msg))
-
-            create_zip_from_chapters(chapters, zip_path, status_callback)
+            # Create ZIP with all chapters - run in thread pool to avoid blocking
+            # Don't use status_callback to avoid cross-thread issues
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: create_zip_from_chapters(chapters, zip_path, None)
+            )
 
             # Get file size
             file_size = get_file_size(zip_path)
             size_mb = file_size / (1024 * 1024)
 
             # Save to server and get URL
-            await status_message.edit_text("📤 Saving to server...")
             download_url = save_file_to_server(zip_path, f"{safe_title}.zip")
 
-            await status_message.edit_text(
+            # Send result - use a new message if status edit fails
+            result_text = (
                 f"✅ ZIP file created!\n"
                 f"📁 {len(chapters)} chapters\n"
                 f"📦 {size_mb:.1f} MB\n"
                 f"🔗 {download_url}"
             )
 
+            try:
+                await status_message.edit_text(result_text)
+            except Exception:
+                # If editing fails (timeout/connection error), send a new message
+                await message.reply_text(result_text)
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        await status_message.edit_text(f"❌ Error: {str(e)}")
+        error_msg = f"❌ Error: {str(e)}"
+        try:
+            await status_message.edit_text(error_msg)
+        except Exception:
+            await message.reply_text(error_msg)
 
 
 async def process_all_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE, category_url: str, flags: set = None) -> None:
@@ -566,8 +578,16 @@ def main() -> None:
         print("Please set it with: export TELEGRAM_BOT_TOKEN='your_token_here'")
         return
 
-    # Create the Application
-    application = Application.builder().token(token).build()
+    # Create the Application with increased timeout for long operations
+    application = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(60.0)
+        .read_timeout(60.0)
+        .write_timeout(60.0)
+        .pool_timeout(60.0)
+        .build()
+    )
 
     # Add help handler
     application.add_handler(CommandHandler("help", help_command))
