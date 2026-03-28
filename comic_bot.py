@@ -110,7 +110,7 @@ def save_file_to_server(source_path: str, filename: str) -> str:
     if DOWNLOAD_DOMAIN:
         # Remove trailing slash from domain if present
         domain = DOWNLOAD_DOMAIN.rstrip("/")
-        return f"{domain}/{safe_filename}"
+        return f"{domain}/{safe_filename.replace(' ', '%20')}"
     else:
         return f"File saved to: {dest_path}"
 
